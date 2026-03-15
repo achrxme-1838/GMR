@@ -5,6 +5,15 @@ import general_motion_retargeting.utils.lafan_vendor.utils as utils
 from general_motion_retargeting.utils.lafan_vendor.extract import read_bvh
 
 
+def _as_quat_scalar_first(rot):
+    """Return wxyz quaternion across SciPy versions."""
+    try:
+        return rot.as_quat(scalar_first=True)
+    except TypeError:
+        quat_xyzw = rot.as_quat()
+        return np.concatenate([quat_xyzw[..., 3:4], quat_xyzw[..., :3]], axis=-1)
+
+
 def load_bvh_file(bvh_file, format="lafan1"):
     """
     Must return a dictionary with the following structure:
@@ -18,7 +27,7 @@ def load_bvh_file(bvh_file, format="lafan1"):
     global_data = utils.quat_fk(data.quats, data.pos, data.parents)
 
     rotation_matrix = np.array([[1, 0, 0], [0, 0, -1], [0, 1, 0]])
-    rotation_quat = R.from_matrix(rotation_matrix).as_quat(scalar_first=True)
+    rotation_quat = _as_quat_scalar_first(R.from_matrix(rotation_matrix))
 
     frames = []
     for frame in range(data.pos.shape[0]):
@@ -45,5 +54,4 @@ def load_bvh_file(bvh_file, format="lafan1"):
     human_height = 1.75  # cm to m
 
     return frames, human_height
-
 

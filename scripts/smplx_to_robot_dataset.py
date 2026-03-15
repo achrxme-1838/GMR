@@ -23,7 +23,8 @@ import psutil
 import tracemalloc
 
 
-def check_memory(threshold_gb=30):  # adjust based on your available memory
+# def check_memory(threshold_gb=30):  # adjust based on your available memory
+def check_memory(threshold_gb=10):  # adjust based on your available memory
     mem = psutil.virtual_memory()
     used_memory_gb = (mem.total - mem.available) / (1024 ** 3)
     available_memory_gb = mem.available / (1024 ** 3)
@@ -212,6 +213,9 @@ def main():
     for dirpath, _, filenames in os.walk(src_folder):
         for filename in natsorted(filenames):
             if filename.endswith("_stagei.npz"):
+                continue
+            # AMASS metadata file (contains only gender/betas, no motion sequence).
+            if filename.lower() == "shape.npz":
                 continue
             if filename.endswith((".pkl", ".npz")):
                 smplx_file_path = os.path.join(dirpath, filename)

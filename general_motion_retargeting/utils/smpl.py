@@ -7,17 +7,120 @@ from scipy.interpolate import interp1d
 
 import general_motion_retargeting.utils.lafan_vendor.utils as utils
 
+
+def _normalize_gender(gender, default="neutral"):
+    if gender is None:
+        return default
+    if isinstance(gender, np.ndarray):
+        if gender.ndim == 0:
+            gender = gender.item()
+        elif gender.size > 0:
+            gender = gender.reshape(-1)[0]
+    if isinstance(gender, bytes):
+        gender = gender.decode("utf-8")
+    gender = str(gender).lower()
+    if gender in {"male", "female", "neutral"}:
+        return gender
+    return default
+
+
+def _to_smplx_schema(raw_data):
+    """Convert different motion-file schemas into SMPL-X keys used by this repo."""
+    if isinstance(raw_data, np.lib.npyio.NpzFile):
+        has_key = lambda k: k in raw_data.files
+    else:
+        has_key = lambda k: k in raw_data
+
+    def get_value(key, default=None):
+        if has_key(key):
+            return raw_data[key]
+        return default
+
+    betas = np.asarray(get_value("betas", np.zeros(10, dtype=np.float32)))
+    gender = _normalize_gender(get_value("gender", "neutral"))
+
+    if has_key("pose_body") and has_key("root_orient"):
+        pose_body = np.asarray(get_value("pose_body"))
+        root_orient = np.asarray(get_value("root_orient"))
+    else:
+        poses = np.asarray(get_value("poses"))
+        if poses.ndim != 2 or poses.shape[1] < 66:
+            raise KeyError("Expected either (pose_body, root_orient) or poses with at least 66 dims.")
+        root_orient = poses[:, :3]
+        pose_body = poses[:, 3:66]
+
+    trans = np.asarray(get_value("trans", np.zeros((pose_body.shape[0], 3), dtype=np.float32)))
+    mocap_frame_rate = get_value("mocap_frame_rate", None)
+    if mocap_frame_rate is None:
+        mocap_frame_rate = get_value("mocap_framerate", 30)
+    mocap_frame_rate = np.asarray(mocap_frame_rate)
+
+    return {
+        "pose_body": pose_body,
+        "root_orient": root_orient,
+        "trans": trans,
+        "betas": betas,
+        "gender": gender,
+        "mocap_frame_rate": mocap_frame_rate,
+    }
+
+
+def _as_quat_scalar_first(rot):
+    """Return quaternions as wxyz across SciPy versions."""
+    try:
+        return rot.as_quat(scalar_first=True)
+    except TypeError:
+        quat_xyzw = rot.as_quat()
+        return np.concatenate([quat_xyzw[..., 3:4], quat_xyzw[..., :3]], axis=-1)
+
+
+def _infer_num_betas(raw_betas, default=10):
+    """Infer how many shape betas are provided in the input data."""
+    betas_arr = np.asarray(raw_betas)
+    if betas_arr.size == 0:
+        return default
+    if betas_arr.ndim == 0:
+        return 1
+    if betas_arr.ndim == 1:
+        return int(betas_arr.shape[0])
+    return int(betas_arr.shape[-1])
+
+
+def _prepare_betas_for_model(raw_betas, body_model):
+    """Convert raw betas to a (1, num_betas) tensor matching the SMPL-X model."""
+    betas_arr = np.asarray(raw_betas, dtype=np.float32)
+    if betas_arr.ndim == 0:
+        betas_arr = betas_arr.reshape(1)
+    elif betas_arr.ndim > 1:
+        # Shape is usually (1, B) or (T, B); SMPL-X expects one shape vector.
+        betas_arr = betas_arr[0]
+
+    betas_arr = betas_arr.reshape(-1)
+    target_num_betas = int(getattr(body_model, "num_betas", betas_arr.shape[0]))
+
+    if betas_arr.shape[0] > target_num_betas:
+        betas_arr = betas_arr[:target_num_betas]
+    elif betas_arr.shape[0] < target_num_betas:
+        betas_arr = np.pad(betas_arr, (0, target_num_betas - betas_arr.shape[0]))
+
+    return torch.tensor(betas_arr).float().view(1, -1)
+
 def load_smpl_file(smpl_file):
     smpl_data = np.load(smpl_file, allow_pickle=True)
     return smpl_data
 
 def load_smplx_file(smplx_file, smplx_body_model_path):
-    smplx_data = np.load(smplx_file, allow_pickle=True)
+    raw_smplx_data = np.load(smplx_file, allow_pickle=True)
+    smplx_data = _to_smplx_schema(raw_smplx_data)
+    if hasattr(raw_smplx_data, "close"):
+        raw_smplx_data.close()
+    requested_num_betas = _infer_num_betas(smplx_data["betas"])
     body_model = smplx.create(
         smplx_body_model_path,
         "smplx",
         gender=str(smplx_data["gender"]),
         use_pca=False,
+        num_betas=requested_num_betas,
     )
     # print(smplx_data["pose_body"].shape)
     # print(smplx_data["betas"].shape)
@@ -25,8 +128,9 @@ def load_smplx_file(smplx_file, smplx_body_model_path):
     # print(smplx_data["trans"].shape)
     
     num_frames = smplx_data["pose_body"].shape[0]
+    betas = _prepare_betas_for_model(smplx_data["betas"], body_model)
     smplx_output = body_model(
-        betas=torch.tensor(smplx_data["betas"]).float().view(1, -1), # (16,)
+        betas=betas,
         global_orient=torch.tensor(smplx_data["root_orient"]).float(), # (N, 3)
         body_pose=torch.tensor(smplx_data["pose_body"]).float(), # (N, 63)
         transl=torch.tensor(smplx_data["trans"]).float(), # (N, 3)
@@ -55,7 +159,7 @@ def load_gvhmr_pred_file(gvhmr_pred_file, smplx_body_model_path):
     # print(smpl_params_global['global_orient'].shape)
     # print(smpl_params_global['transl'].shape)
     
-    betas = np.pad(smpl_params_global['betas'][0], (0,6))
+    betas = smpl_params_global['betas'][0].numpy()
     
     # correct rotations
     # rotation_matrix = np.array([[1, 0, 0], [0, 0, -1], [0, 1, 0]])
@@ -77,11 +181,13 @@ def load_gvhmr_pred_file(gvhmr_pred_file, smplx_body_model_path):
         "smplx",
         gender="neutral",
         use_pca=False,
+        num_betas=_infer_num_betas(betas),
     )
     
     num_frames = smpl_params_global['body_pose'].shape[0]
+    betas = _prepare_betas_for_model(smplx_data["betas"], body_model)
     smplx_output = body_model(
-        betas=torch.tensor(smplx_data["betas"]).float().view(1, -1), # (16,)
+        betas=betas,
         global_orient=torch.tensor(smplx_data["root_orient"]).float(), # (N, 3)
         body_pose=torch.tensor(smplx_data["pose_body"]).float(), # (N, 63)
         transl=torch.tensor(smplx_data["trans"]).float(), # (N, 3)
@@ -127,7 +233,7 @@ def get_smplx_data(smplx_data, body_model, smplx_output, curr_frame):
                 full_body_pose[i].squeeze()
             )
         joint_orientations.append(rot)
-        result[joint_name] = (joints[i], rot.as_quat(scalar_first=True))
+        result[joint_name] = (joints[i], _as_quat_scalar_first(rot))
 
   
     return result
@@ -251,7 +357,7 @@ def get_smplx_data_offline_fast(smplx_data, body_model, smplx_output, tgt_fps=30
                     single_full_body_pose[i].squeeze()
                 )
             joint_orientations.append(rot)
-            result[joint_name] = (single_joints[i], rot.as_quat(scalar_first=True))
+            result[joint_name] = (single_joints[i], _as_quat_scalar_first(rot))
 
 
         smplx_data_frames.append(result)
@@ -344,14 +450,14 @@ def get_gvhmr_data_offline_fast(smplx_data, body_model, smplx_output, tgt_fps=30
                     single_full_body_pose[i].squeeze()
                 )
             joint_orientations.append(rot)
-            result[joint_name] = (single_joints[i], rot.as_quat(scalar_first=True))
+            result[joint_name] = (single_joints[i], _as_quat_scalar_first(rot))
 
 
         smplx_data_frames.append(result)
         
     # add correct rotations
     rotation_matrix = np.array([[1, 0, 0], [0, 0, -1], [0, 1, 0]])
-    rotation_quat = R.from_matrix(rotation_matrix).as_quat(scalar_first=True)
+    rotation_quat = _as_quat_scalar_first(R.from_matrix(rotation_matrix))
     for result in smplx_data_frames:
         for joint_name in result.keys():
             orientation = utils.quat_mul(rotation_quat, result[joint_name][1])

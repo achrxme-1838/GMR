@@ -10,6 +10,16 @@ import numpy as np
 from rich import print
 
 
+def _quat_wxyz_to_matrix(quat):
+    """Convert wxyz quaternion to rotation matrix across SciPy versions."""
+    quat = np.asarray(quat)
+    try:
+        return R.from_quat(quat, scalar_first=True).as_matrix()
+    except TypeError:
+        quat_xyzw = np.concatenate([quat[..., 1:4], quat[..., 0:1]], axis=-1)
+        return R.from_quat(quat_xyzw).as_matrix()
+
+
 def draw_frame(
     pos,
     mat,
@@ -136,7 +146,7 @@ class RobotMotionViewer:
             for human_body_name, (pos, rot) in human_motion_data.items():
                 draw_frame(
                     pos,
-                    R.from_quat(rot, scalar_first=True).as_matrix(),
+                    _quat_wxyz_to_matrix(rot),
                     self.viewer,
                     human_point_scale,
                     pos_offset=human_pos_offset,
